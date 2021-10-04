@@ -5,49 +5,87 @@ from flask import Flask, request
 from flask_cors import CORS
 from flask_pymongo import PyMongo
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+from pytz import timezone
+
+
+# gestisce la definizione del numero di values
+def get_num__hours(date_input, input_tz):
+    num_of_values = 24
+
+    # data giorno dopo
+    next_day = date_input + timedelta(1)
+
+    # preparo le variabili timezone
+    utc = pytz.utc
+    input_timezone = timezone(input_tz)
+
+    # creo la data localized
+    loc_date = input_timezone.localize(date_input)
+    loc_next_date = input_timezone.localize(next_day)
+
+    # trasformo in UTC
+    date_utc = loc_date.astimezone(utc)
+    next_utc = loc_next_date.astimezone(utc)
+
+    # controllo se ci sono differenze con l'orario del giorno dopo in UTC
+    # se ci sono variazioni cambio il numero di ore
+    hour_gap = next_utc.hour - date_utc.hour
+
+    if hour_gap != 0:
+        num_of_values += hour_gap
+
+    return date_utc, num_of_values
 
 
 # funzione che gestisce la logica della creazione dei curve values
-def get_dates(dates):
+def get_dates(start_date, end_date, input_tz):
 
-    previous_date = ""
+    date_change = start_date
 
-    for date in dates:
+    # loop che genera tutto il range di date
+    while date_change < end_date:
+        date_utc, num_values = get_num__hours(date_change, input_tz)
+        values = {str(i): i for i in range(num_values)}
 
-        num_values = 24
+        yield date_utc, values
 
-        next_date = date \
-            .replace(tzinfo=pytz.timezone('europe/rome')) \
-            .astimezone(pytz.utc).strftime("%Y:%m:%d %H:%M:%S")
-
-        if previous_date and previous_date != next_date:
-
-            if int(next_date[-8:-6]) > int(previous_date[-8:-6]):
-                num_values = 25
-            elif int(next_date[-8:-6]) < int(previous_date[-8:-6]):
-                num_values = 23
-
-            values = {str(i): i for i in range(num_values)}
-
-            yield previous_date, values
-
-        previous_date = next_date
+        date_change += timedelta(1)
 
 
 # funzione che cicla i dati creati e li inserisce nel database
 def insert_in_DB(data_object):
 
+    # loop che inserisce a db le curve values
     for date, values in data_object:
+        print(type(date))
         db.cv_collection.insert_one(
             {
-                "date": datetime.strptime(date, "%Y:%m:%d %H:%M:%S"),
+                "date": date,
                 "values": values
             }
         )
 
+    # creo un indice sul campo "date" per migliorare future
+    # prestazioni di ricerca sul campo stesso
     db.cv_collection.create_index("date")
+
+
+# funzione che fa l'intersezione tra i documenti richiesti dalla
+# GET e quelli presenti nel DB
+def retreive_from_DB(data_object):
+    for date, values in data_object:
+        response = db.cv_collection.find_one({"date": date})
+        print(date)
+
+        # per tutte le date non presenti ritorna lo stesso numero
+        # di curve values ma con valore NULL
+        if response is None:
+            values = {str(i): None for i in range(len(values))}
+
+        full_document = {"date": str(date), "values": values}
+        yield full_document
 
 
 # classe che genera l'api
@@ -56,24 +94,23 @@ class MyApi(Resource):
     # funzione che raccoglie tutti i values sotto forma di lista
     def get(self):
 
-        response = request.get_json()
-        start_date = response["start_date"]
-        end_date = response["end_date"]
+        try:
+            # prendo i dati presenti nel json
+            response = request.get_json()
+            start_date = response["start_date"]
+            end_date = response["end_date"]
+            user_timezone = response["timezone"]
 
-        datelist = pd.date_range(
-            start=datetime(start_date['year'], start_date['month'], start_date['day']),
-            end=datetime(end_date['year'], end_date['month'], end_date['day'])
-        )
+            date_start = datetime(start_date['year'], start_date['month'], start_date['day'])
+            date_end = datetime(end_date['year'], end_date['month'], end_date['day'])
 
-        values_list = []
-        datas = db.cv_collection.find()
+            date_values_obj = get_dates(date_start, date_end, user_timezone)
+            documents_resp = retreive_from_DB(date_values_obj)
 
-        for data in datas:
-            values = list(data["values"].values())
-            values_list += values
-        print(datelist)
+            return list(documents_resp)
 
-        return values_list
+        except Exception as e:
+            return "ERROR: " + str(e), 500
 
     # funzione che popola il database
     def post(self):
@@ -82,18 +119,17 @@ class MyApi(Resource):
             response = request.get_json()
             start_date = response["start_date"]
             end_date = response["end_date"]
+            user_timezone = response["timezone"]
 
-            datelist = pd.date_range(
-                start=datetime(start_date['year'], start_date['month'], start_date['day']),
-                end=datetime(end_date['year'], end_date['month'], end_date['day'])
-            )
+            date_start = datetime(start_date['year'], start_date['month'], start_date['day'])
+            date_end = datetime(end_date['year'], end_date['month'], end_date['day'])
 
             # escludo tutti i lunedi dalle date
-            datelist = [date for date in datelist if date.weekday() != 0]
+            # datelist = [date for date in datelist if date.weekday() != 0]
 
-            date_values = get_dates(datelist)
+            date_values_obj = get_dates(date_start, date_end, user_timezone)
 
-            insert_in_DB(date_values)
+            insert_in_DB(date_values_obj)
 
             return "Dati inseriti", 201
 
